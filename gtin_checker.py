@@ -61,6 +61,11 @@ LOCK_HEADERS = (
     "state",
 )
 
+CHECK_DIGIT_ERROR_MARKERS = (
+    "last digit of your barcode number is incorrect",
+    "check digit is incorrect",
+    "incorrect check digit",
+)
 NEGATIVE_MARKERS = (
     "not found",
     "no result",
@@ -71,6 +76,7 @@ NEGATIVE_MARKERS = (
     "could not be found",
     "does not exist",
     "unable to verify",
+    *CHECK_DIGIT_ERROR_MARKERS,
 )
 BLOCK_MARKERS = (
     "too many requests",
@@ -239,6 +245,13 @@ def compact_text(value: str, limit: int = 3500) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
+def check_digit_error_message(barcode: str, result_text: str) -> Optional[str]:
+    lower = result_text.lower()
+    if not any(marker in lower for marker in CHECK_DIGIT_ERROR_MARKERS):
+        return None
+    return f"체크 디지트 오류: 입력 {barcode}"
+
+
 class SheetCoordinator:
     """숨김 로그 시트를 사용해 여러 PC의 같은 행 처리를 조정한다.
 
@@ -272,7 +285,11 @@ class SheetCoordinator:
                 rows=2000,
                 cols=len(LOCK_HEADERS),
             )
-            lock_sheet.update([list(LOCK_HEADERS)], "A1:F1")
+            lock_sheet.update(
+                values=[list(LOCK_HEADERS)],
+                range_name="A1:F1",
+                value_input_option="RAW",
+            )
             try:
                 lock_sheet.hide()
             except Exception:
@@ -373,8 +390,8 @@ class SheetCoordinator:
         if status not in FINAL_STATUSES:
             raise ValueError(f"완료 상태가 올바르지 않습니다: {status}")
         self.worksheet.update(
-            [[status, result]],
-            f"Q{claim.data_row}:R{claim.data_row}",
+            values=[[status, result]],
+            range_name=f"Q{claim.data_row}:R{claim.data_row}",
             value_input_option="RAW",
         )
         self._set_claim_state(claim.lock_row, "DONE")
@@ -383,8 +400,8 @@ class SheetCoordinator:
         # Q열은 확인중으로 두고 R열에 중단 사유를 남긴다. CLAIMED 상태는
         # stale_minutes 동안 다른 PC가 가져가지 못하도록 유지한다.
         self.worksheet.update(
-            [[STATUS_WORKING, reason]],
-            f"Q{claim.data_row}:R{claim.data_row}",
+            values=[[STATUS_WORKING, reason]],
+            range_name=f"Q{claim.data_row}:R{claim.data_row}",
             value_input_option="RAW",
         )
 
@@ -434,11 +451,20 @@ class GS1Browser:
 
     def _visible_terms_dialog(self) -> bool:
         dialogs = self.driver.find_elements(By.CSS_SELECTOR, ".ui-dialog, [role='dialog']")
-        return any(
+        if any(
             dialog.is_displayed()
             and "Terms of Use" in dialog.text
             and "Accept" in dialog.text
             for dialog in dialogs
+        ):
+            return True
+
+        # GS1의 새 팝업은 dialog role/class 없이 표시되므로 실제 동의 버튼도
+        # 함께 확인한다. 숨겨진 템플릿 버튼은 제외해 오탐을 막는다.
+        accept_buttons = self.driver.find_elements(By.CSS_SELECTOR, "button.btn-accept")
+        return any(
+            button.is_displayed() and button.text.strip().lower() == "accept"
+            for button in accept_buttons
         )
 
 
@@ -479,9 +505,32 @@ class GS1Browser:
 
         
         text = self._extract_result_text(barcode)
+        if not text:
+            # 검색 직후 로딩용 요소가 잠깐 결과처럼 보이고, 약관 팝업은 뒤늦게
+            # 렌더링되는 경우가 있다. 짧게 재확인해 빈 결과로 오판하지 않는다.
+            try:
+                WebDriverWait(self.driver, min(5, self.timeout)).until(
+                    lambda d: self._visible_terms_dialog()
+                    or bool(self._extract_result_text(barcode))
+                )
+            except TimeoutException:
+                pass
+
+            if self._visible_terms_dialog():
+                self._wait_for_manual_gate("이용약관 동의", manual_wait)
+                self.driver.get(f"{GS1_URL}?gtin={barcode}")
+                try:
+                    self.wait.until(lambda d: self._lookup_finished(barcode))
+                except TimeoutException as exc:
+                    raise QueryBlocked("GS1 조회 결과를 제한 시간 안에 받지 못했습니다.") from exc
+            text = self._extract_result_text(barcode)
+
         lower = text.lower()
         if any(marker in lower for marker in BLOCK_MARKERS):
             raise QueryBlocked(text)
+        check_digit_error = check_digit_error_message(barcode, text)
+        if check_digit_error:
+            return LookupResult(verified=False, text=check_digit_error)
         verified = not any(marker in lower for marker in NEGATIVE_MARKERS)
         if not text:
             raise QueryBlocked("GS1 결과 내용을 판독하지 못했습니다.")
