@@ -154,6 +154,52 @@ def kill_chrome_processes() -> None:
         logging.warning("Chrome 프로세스 정리 중 오류: %s", exc)
 
 
+def clear_chrome_cookies(profile_dir: Path, label: str = "Chrome") -> None:
+    """지정한 Chrome 프로필 경로에 저장된 모든 쿠키 파일을 삭제한다."""
+
+    if not profile_dir.exists():
+        logging.info("%s 프로필 디렉터리가 없어 쿠키 삭제를 건너뜁니다: %s", label, profile_dir)
+        return
+
+    cookie_file_names = {"Cookies", "Cookies-journal", "Cookies-shm", "Cookies-wal"}
+    profile_root = profile_dir.resolve()
+    deleted_count = 0
+    for cookie_file_name in cookie_file_names:
+        for cookie_file in profile_root.glob(f"**/{cookie_file_name}"):
+            try:
+                if not cookie_file.is_file():
+                    continue
+                cookie_file.resolve().relative_to(profile_root)
+                cookie_file.unlink()
+                deleted_count += 1
+            except ValueError:
+                logging.warning("프로필 밖의 쿠키 파일은 삭제하지 않습니다: %s", cookie_file)
+            except Exception as exc:
+                logging.warning("쿠키 파일 삭제 실패: %s (%s)", cookie_file, exc)
+
+    logging.info("%s 저장 쿠키 파일 %d개를 삭제했습니다.", label, deleted_count)
+
+
+def default_chrome_user_data_dir() -> Optional[Path]:
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if not local_app_data:
+        logging.warning("LOCALAPPDATA 환경 변수가 없어 기본 Chrome 쿠키 경로를 찾지 못했습니다.")
+        return None
+    return Path(local_app_data) / "Google" / "Chrome" / "User Data"
+
+
+def clear_default_chrome_cookies(exclude_dir: Optional[Path] = None) -> None:
+    chrome_user_data = default_chrome_user_data_dir()
+    if not chrome_user_data:
+        return
+
+    if exclude_dir and chrome_user_data.resolve() == exclude_dir.resolve():
+        logging.info("기본 Chrome 경로가 조회용 프로필과 같아 중복 쿠키 삭제를 건너뜁니다.")
+        return
+
+    clear_chrome_cookies(chrome_user_data, "기본 Chrome")
+
+
 @dataclass(frozen=True)
 class Claim:
     data_row: int
@@ -429,13 +475,32 @@ class GS1Browser:
             pass
 
     def _dismiss_cookie_banner(self) -> None:
-        for element_id in ("onetrust-reject-all-handler", "onetrust-accept-btn-handler"):
-            elements = self.driver.find_elements(By.ID, element_id)
-            if elements and elements[0].is_displayed():
-                # 분석/광고 쿠키가 필요하지 않으므로 기본적으로 선택 쿠키를 거부한다.
-                if element_id == "onetrust-reject-all-handler":
+        reject_labels = {
+            "reject all optional cookies",
+            "reject all",
+            "reject",
+        }
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline:
+            for button in self.driver.find_elements(By.TAG_NAME, "button"):
+                try:
+                    label = re.sub(r"\s+", " ", button.text).strip().lower()
+                    if button.is_displayed() and label in reject_labels:
+                        self.driver.execute_script("arguments[0].click()", button)
+                        logging.info("쿠키 배너의 선택 쿠키 거부 버튼을 자동 클릭했습니다.")
+                        return
+                except Exception:
+                    continue
+
+            for element_id in ("onetrust-reject-all-handler", "onetrust-accept-btn-handler"):
+                elements = self.driver.find_elements(By.ID, element_id)
+                if elements and elements[0].is_displayed():
+                    # 분석/광고 쿠키가 필요하지 않으므로 기본적으로 선택 쿠키를 거부한다.
                     self.driver.execute_script("arguments[0].click()", elements[0])
-                break
+                    logging.info("쿠키 배너 버튼을 자동 클릭했습니다: %s", element_id)
+                    return
+
+            time.sleep(0.5)
 
     def _page_text(self) -> str:
         try:
@@ -468,6 +533,28 @@ class GS1Browser:
         )
 
 
+    def _accept_terms_dialog(self, seconds: int) -> None:
+        logging.info("이용약관 팝업을 감지해 Accept 버튼을 자동 클릭합니다.")
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            accept_buttons = self.driver.find_elements(By.CSS_SELECTOR, "button.btn-accept")
+            for button in accept_buttons:
+                if button.is_displayed() and button.text.strip().lower() == "accept":
+                    self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'})", button)
+                    self.driver.execute_script("arguments[0].click()", button)
+                    try:
+                        WebDriverWait(self.driver, min(10, seconds)).until(
+                            lambda d: not self._visible_terms_dialog()
+                        )
+                    except TimeoutException:
+                        pass
+                    if not self._visible_terms_dialog():
+                        return
+
+            time.sleep(0.5)
+        raise ManualActionRequired("이용약관 Accept 버튼 자동 클릭 실패")
+
+
     def _wait_for_manual_gate(self, description: str, seconds: int) -> None:
         logging.warning("%s 브라우저에서 직접 처리해 주세요. 최대 %d초 기다립니다.", description, seconds)
         deadline = time.monotonic() + seconds
@@ -493,7 +580,7 @@ class GS1Browser:
         submit.click()  # 실제 mousedown 이벤트가 URL의 ?gtin= 값을 만든다.
 
         if self._visible_terms_dialog():
-            self._wait_for_manual_gate("이용약관 동의", manual_wait)
+            self._accept_terms_dialog(manual_wait)
             # 동의 직후 첫 요청이 자동 재전송되지 않는 사이트 버전도 있어 재조회한다.
             self.driver.get(f"{GS1_URL}?gtin={barcode}")
 
@@ -517,7 +604,7 @@ class GS1Browser:
                 pass
 
             if self._visible_terms_dialog():
-                self._wait_for_manual_gate("이용약관 동의", manual_wait)
+                self._accept_terms_dialog(manual_wait)
                 self.driver.get(f"{GS1_URL}?gtin={barcode}")
                 try:
                     self.wait.until(lambda d: self._lookup_finished(barcode))
@@ -641,7 +728,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--mac-change-interval",
         type=int,
-        default=20,
+        default=10,
         help="지정한 조회 횟수마다 MAC 주소와 IP를 변경합니다. 0이면 비활성화",
     )
     parser.add_argument("--adapter-key", default=DEFAULT_ADAPTER_KEY, help="MAC 변경 대상 어댑터 레지스트리 키")
@@ -690,6 +777,11 @@ def run(args: argparse.Namespace) -> int:
     lookup_count = 0
     write_count = 0
 
+    logging.info("프로그램 시작 전 Chrome 쿠키를 정리합니다.")
+    kill_chrome_processes()
+    clear_chrome_cookies(profile_dir, "GS1 조회용 Chrome")
+    clear_default_chrome_cookies(exclude_dir=profile_dir)
+
     def open_browser() -> GS1Browser:
         logging.info("GS1 조회 브라우저를 시작합니다.")
         return GS1Browser(profile_dir, args.headless, args.timeout)
@@ -700,6 +792,8 @@ def run(args: argparse.Namespace) -> int:
             browser.close()
             browser = None
         kill_chrome_processes()
+        clear_chrome_cookies(profile_dir, "GS1 조회용 Chrome")
+        clear_default_chrome_cookies(exclude_dir=profile_dir)
         change_mac(args.adapter_key, args.adapter_interface)
         time.sleep(5)
 
