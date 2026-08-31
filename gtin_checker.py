@@ -87,6 +87,17 @@ BLOCK_MARKERS = (
     "service unavailable",
 )
 
+USER_AGENTS = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:129.0) Gecko/20100101 Firefox/129.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:130.0) Gecko/20100101 Firefox/130.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36 Edg/128.0.0.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36 Edg/129.0.0.0",
+)
+
 DEFAULT_ADAPTER_KEY = (
     r"HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\Class"
     r"\{4d36e972-e325-11ce-bfc1-08002be10318}\0001"
@@ -111,6 +122,11 @@ def get_current_ip() -> str:
         return requests.get("https://api.ipify.org", timeout=10).text.strip()
     except Exception:
         return "unknown"
+
+
+def random_user_agent(exclude: Optional[str] = None) -> str:
+    candidates = [user_agent for user_agent in USER_AGENTS if user_agent != exclude]
+    return random.choice(candidates or list(USER_AGENTS))
 
 
 def change_mac(adapter_key: str, adapter_interface_name: str) -> str:
@@ -453,12 +469,21 @@ class SheetCoordinator:
 
 
 class GS1Browser:
-    def __init__(self, profile_dir: Path, headless: bool, timeout: int) -> None:
+    def __init__(
+        self,
+        profile_dir: Path,
+        headless: bool,
+        timeout: int,
+        user_agent: Optional[str] = None,
+    ) -> None:
         options = webdriver.ChromeOptions()
         options.add_argument("--window-size=1500,1000")
         options.add_argument("--no-first-run")
         options.add_argument("--disable-popup-blocking")
         options.add_argument(f"--user-data-dir={profile_dir.resolve()}")
+        if user_agent:
+            options.add_argument(f"--user-agent={user_agent}")
+            logging.info("Chrome User-Agent 설정: %s", user_agent)
         if headless:
             options.add_argument("--headless=new")
         self.driver = webdriver.Chrome(options=options)
@@ -776,6 +801,7 @@ def run(args: argparse.Namespace) -> int:
     browser: Optional[GS1Browser] = None
     lookup_count = 0
     write_count = 0
+    current_user_agent = random_user_agent()
 
     logging.info("프로그램 시작 전 Chrome 쿠키를 정리합니다.")
     kill_chrome_processes()
@@ -784,10 +810,10 @@ def run(args: argparse.Namespace) -> int:
 
     def open_browser() -> GS1Browser:
         logging.info("GS1 조회 브라우저를 시작합니다.")
-        return GS1Browser(profile_dir, args.headless, args.timeout)
+        return GS1Browser(profile_dir, args.headless, args.timeout, current_user_agent)
 
     def rotate_network() -> None:
-        nonlocal browser
+        nonlocal browser, current_user_agent
         if browser:
             browser.close()
             browser = None
@@ -795,6 +821,8 @@ def run(args: argparse.Namespace) -> int:
         clear_chrome_cookies(profile_dir, "GS1 조회용 Chrome")
         clear_default_chrome_cookies(exclude_dir=profile_dir)
         change_mac(args.adapter_key, args.adapter_interface)
+        current_user_agent = random_user_agent(exclude=current_user_agent)
+        logging.warning("IP 변경 후 새 User-Agent를 선택했습니다: %s", current_user_agent)
         time.sleep(5)
 
     try:
